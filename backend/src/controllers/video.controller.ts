@@ -1,57 +1,48 @@
 import { Response } from 'express';
-import { PrismaClient, VideoStatus, VideoType } from '@prisma/client';
+import { supabase } from '../config/supabaseClient';
 import { AuthRequest } from '../middleware/auth';
 
-const prisma = new PrismaClient();
+const VIDEO_STATUSES = ['DRAFT', 'IN_REVIEW', 'PUBLISHED', 'REJECTED', 'REPORTED'];
+const VIDEO_TYPES = ['VIDEO', 'SHORTS'];
 
 // GET /api/videos?status=PUBLISHED&page=1&limit=20
 export async function listVideos(req: AuthRequest, res: Response): Promise<void> {
   const { status, page = '1', limit = '20' } = req.query as Record<string, string>;
 
-  const where: Record<string, unknown> = { reporterId: req.reporterId };
-  if (status && Object.values(VideoStatus).includes(status as VideoStatus)) {
-    where.status = status as VideoStatus;
-  }
-
   const take = Math.min(parseInt(limit, 10), 100);
   const skip = (parseInt(page, 10) - 1) * take;
 
-  const [videos, total] = await Promise.all([
-    prisma.video.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      skip,
-      take,
-      select: {
-        id: true,
-        title: true,
-        description: true,
-        type: true,
-        status: true,
-        thumbnailUrl: true,
-        videoUrl: true,
-        duration: true,
-        views: true,
-        likes: true,
-        rejectionNote: true,
-        reportReason: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-    }),
-    prisma.video.count({ where }),
-  ]);
+  let query = supabase
+    .from('videos')
+    .select('id, title, description, type, status, thumbnail_url, video_url, duration, views, likes, rejection_note, report_reason, created_at, updated_at', { count: 'exact' })
+    .eq('reporter_id', req.reporterId)
+    .order('created_at', { ascending: false })
+    .range(skip, skip + take - 1);
 
-  res.json({ videos, total, page: parseInt(page, 10), limit: take });
+  if (status && VIDEO_STATUSES.includes(status)) {
+    query = query.eq('status', status);
+  }
+
+  const { data: videos, count, error } = await query;
+
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
+
+  res.json({ videos, total: count ?? 0, page: parseInt(page, 10), limit: take });
 }
 
 // GET /api/videos/:id
 export async function getVideo(req: AuthRequest, res: Response): Promise<void> {
-  const video = await prisma.video.findFirst({
-    where: { id: req.params.id, reporterId: req.reporterId },
-  });
+  const { data: video, error } = await supabase
+    .from('videos')
+    .select('*')
+    .eq('id', req.params.id)
+    .eq('reporter_id', req.reporterId)
+    .single();
 
-  if (!video) {
+  if (error || !video) {
     res.status(404).json({ error: 'Video not found' });
     return;
   }
@@ -59,8 +50,7 @@ export async function getVideo(req: AuthRequest, res: Response): Promise<void> {
   res.json(video);
 }
 
-// POST /api/videos  (creates a DRAFT)
-// multipart/form-data with fields: title, description, type + file "video" + optional "thumbnail"
+// POST /api/videos
 export async function createVideo(req: AuthRequest, res: Response): Promise<void> {
   const { title, description = '', type = 'VIDEO' } = req.body as {
     title: string;
@@ -73,44 +63,52 @@ export async function createVideo(req: AuthRequest, res: Response): Promise<void
     return;
   }
 
-  const files = req.files as { [fieldname: string]: Express.MulterS3.File[] } | undefined;
-  const videoFile = files?.video?.[0];
-  const thumbFile = files?.thumbnail?.[0];
+  const files = req.files as { [fieldname: string]: Express.Multer.File[] } | undefined;
+  const videoFile = files?.video?.[0] as any;
+  const thumbFile = files?.thumbnail?.[0] as any;
 
-  const videoUrl = videoFile
-    ? (videoFile.location ?? `/uploads/${videoFile.filename}`)
-    : undefined;
-  const thumbnailUrl = thumbFile
-    ? (thumbFile.location ?? `/uploads/${thumbFile.filename}`)
-    : undefined;
+  const videoUrl = videoFile ? (videoFile.location ?? `/uploads/${videoFile.filename}`) : null;
+  const thumbnailUrl = thumbFile ? (thumbFile.location ?? `/uploads/${thumbFile.filename}`) : null;
 
-  const video = await prisma.video.create({
-    data: {
+  const { data: video, error } = await supabase
+    .from('videos')
+    .insert({
       title,
       description,
-      type: Object.values(VideoType).includes(type as VideoType) ? (type as VideoType) : VideoType.VIDEO,
-      status: VideoStatus.DRAFT,
-      videoUrl,
-      thumbnailUrl,
-      reporterId: req.reporterId as string,
-    },
-  });
+      type: VIDEO_TYPES.includes(type) ? type : 'VIDEO',
+      status: 'DRAFT',
+      video_url: videoUrl,
+      thumbnail_url: thumbnailUrl,
+      reporter_id: req.reporterId,
+      views: 0,
+      likes: 0,
+    })
+    .select()
+    .single();
+
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
 
   res.status(201).json(video);
 }
 
-// PATCH /api/videos/:id  (update title/description while still a DRAFT)
+// PATCH /api/videos/:id
 export async function updateVideo(req: AuthRequest, res: Response): Promise<void> {
-  const video = await prisma.video.findFirst({
-    where: { id: req.params.id, reporterId: req.reporterId },
-  });
+  const { data: video, error: fetchError } = await supabase
+    .from('videos')
+    .select('id, status')
+    .eq('id', req.params.id)
+    .eq('reporter_id', req.reporterId)
+    .single();
 
-  if (!video) {
+  if (fetchError || !video) {
     res.status(404).json({ error: 'Video not found' });
     return;
   }
 
-  if (video.status !== VideoStatus.DRAFT) {
+  if (video.status !== 'DRAFT') {
     res.status(400).json({ error: 'Only DRAFT videos can be edited' });
     return;
   }
@@ -121,83 +119,121 @@ export async function updateVideo(req: AuthRequest, res: Response): Promise<void
     if (req.body[key] !== undefined) data[key] = req.body[key];
   }
 
-  const updated = await prisma.video.update({ where: { id: req.params.id }, data });
+  const { data: updated, error } = await supabase
+    .from('videos')
+    .update(data)
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
+
   res.json(updated);
 }
 
-// POST /api/videos/:id/submit  (DRAFT → IN_REVIEW)
+// POST /api/videos/:id/submit
 export async function submitVideo(req: AuthRequest, res: Response): Promise<void> {
-  const video = await prisma.video.findFirst({
-    where: { id: req.params.id, reporterId: req.reporterId },
-  });
+  const { data: video, error: fetchError } = await supabase
+    .from('videos')
+    .select('id, status, video_url')
+    .eq('id', req.params.id)
+    .eq('reporter_id', req.reporterId)
+    .single();
 
-  if (!video) {
+  if (fetchError || !video) {
     res.status(404).json({ error: 'Video not found' });
     return;
   }
 
-  if (video.status !== VideoStatus.DRAFT) {
+  if (video.status !== 'DRAFT') {
     res.status(400).json({ error: 'Only DRAFT videos can be submitted for review' });
     return;
   }
 
-  if (!video.videoUrl) {
+  if (!video.video_url) {
     res.status(400).json({ error: 'Cannot submit a video without a video file' });
     return;
   }
 
-  const updated = await prisma.video.update({
-    where: { id: req.params.id },
-    data: { status: VideoStatus.IN_REVIEW },
-  });
+  const { data: updated, error } = await supabase
+    .from('videos')
+    .update({ status: 'IN_REVIEW' })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
 
   res.json(updated);
 }
 
-// DELETE /api/videos/:id  (only DRAFT or REJECTED)
+// DELETE /api/videos/:id
 export async function deleteVideo(req: AuthRequest, res: Response): Promise<void> {
-  const video = await prisma.video.findFirst({
-    where: { id: req.params.id, reporterId: req.reporterId },
-  });
+  const { data: video, error: fetchError } = await supabase
+    .from('videos')
+    .select('id, status')
+    .eq('id', req.params.id)
+    .eq('reporter_id', req.reporterId)
+    .single();
 
-  if (!video) {
+  if (fetchError || !video) {
     res.status(404).json({ error: 'Video not found' });
     return;
   }
 
-  const deletable: VideoStatus[] = [VideoStatus.DRAFT, VideoStatus.REJECTED];
-  if (!deletable.includes(video.status)) {
+  if (!['DRAFT', 'REJECTED'].includes(video.status)) {
     res.status(400).json({ error: 'Only DRAFT or REJECTED videos can be deleted' });
     return;
   }
 
-  await prisma.video.delete({ where: { id: req.params.id } });
+  const { error } = await supabase.from('videos').delete().eq('id', req.params.id);
+
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
+
   res.json({ message: 'Deleted' });
 }
 
 // POST /api/videos/:id/report
-// Body: { reason: "..." }
 export async function reportVideo(req: AuthRequest, res: Response): Promise<void> {
   const { reason } = req.body as { reason?: string };
 
-  const video = await prisma.video.findFirst({
-    where: { id: req.params.id, reporterId: req.reporterId },
-  });
+  const { data: video, error: fetchError } = await supabase
+    .from('videos')
+    .select('id, status')
+    .eq('id', req.params.id)
+    .eq('reporter_id', req.reporterId)
+    .single();
 
-  if (!video) {
+  if (fetchError || !video) {
     res.status(404).json({ error: 'Video not found' });
     return;
   }
 
-  if (video.status !== VideoStatus.PUBLISHED) {
+  if (video.status !== 'PUBLISHED') {
     res.status(400).json({ error: 'Only PUBLISHED videos can be reported' });
     return;
   }
 
-  const updated = await prisma.video.update({
-    where: { id: req.params.id },
-    data: { status: VideoStatus.REPORTED, reportReason: reason ?? '' },
-  });
+  const { data: updated, error } = await supabase
+    .from('videos')
+    .update({ status: 'REPORTED', report_reason: reason ?? '' })
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
 
   res.json(updated);
 }

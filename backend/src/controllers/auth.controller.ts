@@ -1,12 +1,9 @@
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { supabase } from '../config/supabaseClient';
 import { generateOtp, otpExpiresAt, sendOtpSms } from '../utils/otp';
 import { signToken } from '../utils/jwt';
 
-const prisma = new PrismaClient();
-
 // POST /api/auth/send-otp
-// Body: { mobile: "+919876543210" }
 export async function sendOtp(req: Request, res: Response): Promise<void> {
   const { mobile } = req.body as { mobile: string };
 
@@ -18,26 +15,26 @@ export async function sendOtp(req: Request, res: Response): Promise<void> {
   const code = generateOtp();
   const expiresAt = otpExpiresAt();
 
-  // Invalidate any unused previous OTPs for this number
-  await prisma.otp.updateMany({
-    where: { mobile, used: false },
-    data: { used: true },
-  });
+  // Invalidate previous unused OTPs
+  await supabase
+    .from('otps')
+    .update({ used: true })
+    .eq('mobile', mobile)
+    .eq('used', false);
 
-  await prisma.otp.create({ data: { mobile, code, expiresAt } });
+  await supabase.from('otps').insert({ mobile, code, expires_at: expiresAt, used: false });
 
   await sendOtpSms(mobile, code);
 
   const response: Record<string, unknown> = { message: 'OTP sent' };
   if (process.env.NODE_ENV === 'development') {
-    response.dev_otp = code; // expose OTP only in dev
+    response.dev_otp = code;
   }
 
   res.json(response);
 }
 
 // POST /api/auth/verify-otp
-// Body: { mobile: "+919876543210", code: "123456" }
 export async function verifyOtp(req: Request, res: Response): Promise<void> {
   const { mobile, code } = req.body as { mobile: string; code: string };
 
@@ -46,10 +43,16 @@ export async function verifyOtp(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const otp = await prisma.otp.findFirst({
-    where: { mobile, code, used: false, expiresAt: { gt: new Date() } },
-    orderBy: { createdAt: 'desc' },
-  });
+  const { data: otp } = await supabase
+    .from('otps')
+    .select('*')
+    .eq('mobile', mobile)
+    .eq('code', code)
+    .eq('used', false)
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .single();
 
   if (!otp) {
     res.status(400).json({ error: 'Invalid or expired OTP' });
@@ -57,16 +60,26 @@ export async function verifyOtp(req: Request, res: Response): Promise<void> {
   }
 
   // Mark OTP as used
-  await prisma.otp.update({ where: { id: otp.id }, data: { used: true } });
+  await supabase.from('otps').update({ used: true }).eq('id', otp.id);
 
   // Find or create reporter
-  let reporter = await prisma.reporter.findUnique({ where: { mobile } });
+  let { data: reporter } = await supabase
+    .from('reporters')
+    .select('*')
+    .eq('mobile', mobile)
+    .single();
+
   if (!reporter) {
-    reporter = await prisma.reporter.create({ data: { mobile } });
+    const { data: newReporter } = await supabase
+      .from('reporters')
+      .insert({ mobile, full_name: '', followers: 0, following: 0, is_active: true })
+      .select()
+      .single();
+    reporter = newReporter;
   }
 
   // Link OTP to reporter
-  await prisma.otp.update({ where: { id: otp.id }, data: { reporterId: reporter.id } });
+  await supabase.from('otps').update({ reporter_id: reporter.id }).eq('id', otp.id);
 
   const token = signToken({ reporterId: reporter.id, mobile: reporter.mobile });
 
@@ -75,8 +88,8 @@ export async function verifyOtp(req: Request, res: Response): Promise<void> {
     reporter: {
       id: reporter.id,
       mobile: reporter.mobile,
-      fullName: reporter.fullName,
-      isNewUser: !reporter.fullName, // hint for onboarding
+      fullName: reporter.full_name,
+      isNewUser: !reporter.full_name,
     },
   });
 }
