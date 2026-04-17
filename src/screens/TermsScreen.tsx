@@ -29,7 +29,7 @@ export default function TermsScreen({ navigation }: any) {
       {/* Logo + Subscribe Row */}
       <View style={styles.logoRow}>
         <Image
-          source={require('../../assets/Pura local logo.png')}
+          source={require('../../assets/logo with black.jpg')}
           style={styles.logo}
           resizeMode="contain"
         />

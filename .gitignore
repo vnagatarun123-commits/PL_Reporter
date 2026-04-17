@@ -1,1 +1,13 @@
+# dependencies
 node_modules
+
+# environment variables (IMPORTANT)
+.env
+.env.*
+
+# expo
+.expo
+
+# build files
+dist
+build

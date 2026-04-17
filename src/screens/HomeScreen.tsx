@@ -237,7 +237,7 @@ export default function HomeScreen() {
         {/* Header */}
         <View style={[styles.header, { paddingTop: STATUS_BAR_HEIGHT + 6 }]}>
           <Image
-            source={require('../../assets/Pura local logo.png')}
+            source={require('../../assets/Logo in white.png')}
             style={styles.logo}
             resizeMode="contain"
           />
